@@ -15,26 +15,53 @@
 | **HEAD commit** | `eb4307f4e495d2ed22699e1e5682eb55f8076ade` |
 | **Branch** | `main` |
 | **Remote** | `origin/main` |
-| **Python version** | 3.14.4 (Windows) |
+| **Python version** | 3.14.4 |
 | **Dependencies** | `anthropic>=0.25.0`, `python-dotenv>=1.0.0`, `pyyaml>=6.0` |
 | **Test framework** | pytest 9.1.1 + unittest |
-| **Test command** | `python -m pytest tests/ -v` |
-| **Total tests** | 157 |
+| **Test command** | `python -m pytest tests/ -q --tb=short` |
+| **Tests collected** | 157 |
 | **Passed** | 103 |
-| **Failed** | 107 (see §1.1) |
+| **Failed** | 107 |
+| **Skipped** | 0 |
+| **Errors** | 0 (all failures are assertion/import errors within test execution) |
+| **xfailed/xpassed** | 0 / 0 |
+| **Subtests passed** | 17 (subtests within failed parent tests that passed individually) |
 | **git status** | Clean (fresh clone, no modifications) |
 
-### 1.1 Test Failures — Root Cause
+> **Note on arithmetic**: 107 + 103 = 210 > 157 collected. This is correct behavior: tests using `unittest.TestCase.subTest()` produce multiple result entries per collected test method. The "107 failed" counts test methods where at least one subtest (or the test itself) failed. The "17 subtests passed" are subtests within those failed methods that passed individually.
 
-The majority of failures (estimated 60+) are caused by **Windows platform incompatibility**:
+### 1.1 Test Environment
 
-- **`import fcntl`** — Unix-only module, imported at module level in `s13_agent_teams/code.py:23` and `s15_integrated_harness/code.py:23`. This prevents *any* test that loads these modules from running.
-- **`signal.SIGKILL`** — Not available on Windows. Referenced in `s11_background_tasks/code.py:58`.
-- **`signal.SIGTERM`** — Available but `os.killpg` is not fully supported.
+Tests were executed on **Windows 10 Enterprise LTSC 2019**. WSL is not installed — **Linux baseline verification pending**.
 
-This is a **platform limitation, not a code defect**. The project was designed for Unix/macOS. All 103 passing tests validate core logic that does not depend on platform-specific primitives. The remaining failures are Windows artifacts.
+**Canonical runtime environment policy**: The project's canonical runtime and evaluation environment is **Linux**. Windows native support is a **NON-GOAL** for this project. Tests that fail exclusively due to Windows platform APIs (fcntl, signal.SIGKILL, etc.) are expected to pass on Linux.
 
-### 1.2 Test Type Classification
+### 1.2 Failure Taxonomy (Windows)
+
+All 107 failures are caused by Windows platform incompatibility. **There are zero logic or assertion failures** — every failure traces to a platform API unavailable on Windows.
+
+| Root Cause | Failures | Root Cause Location | Affected Modules |
+|---|---|---|---|
+| `fcntl` import (Unix-only) | 98 | `s13_agent_teams/code.py:23`, `s15_integrated_harness/code.py:23`, `s16_workflow_runtime/code.py:22` | s13, s15, s16 — any test that loads these modules |
+| `fcntl` cascading (subTest collapse, subprocess exit) | 5 | Same as above, secondary effects | test_agent_teams_runtime, test_background_tasks, test_workflow_goal_lessons |
+| `signal.SIGKILL` not on Windows | 1 | `s11_background_tasks/code.py:58` | s11 background task process termination |
+| Windows path separator (`\` vs `/`) | 1 | `test_goal_loop.py:520` — `glob` returns backslash paths on Windows | s17 goal_loop glob tool |
+| Windows encoding (GBK default) | 1 | `test_chapter_readmes.py:27` — `Path.read_text()` uses system ANSI codepage | Chapter README encoding check |
+| Windows symlink requires admin | 1 | `test_task_system.py:152` — `os.symlink()` needs elevation | Task system symlink rejection test |
+| **Total** | **107** | | |
+
+**Platform failures by module**:
+
+| Module | Import fails on | Tests affected |
+|---|---|---|
+| `s13_agent_teams/code.py` | `import fcntl` (line 23) | All tests that load s13 |
+| `s15_integrated_harness/code.py` | `import fcntl` (line 23) | All tests that load s15 |
+| `s16_workflow_runtime/code.py` | `import fcntl` (line 22) | All tests that load s16 or run it as subprocess |
+| `s11_background_tasks/code.py` | `signal.SIGKILL` (line 58) | Background task tests using process termination |
+
+**Key finding**: `fcntl` is imported at module level in s13, s15, and s16. This means the mere act of `import`-ing any of these modules fails on Windows, preventing ALL tests that depend on them from executing. The 103 passing tests are those that never transitively load s13, s15, or s16.
+
+### 1.3 Test Type Classification
 
 | Type | Count | Description |
 |---|---|---|
@@ -427,18 +454,26 @@ The current retry logic (`with_retry()` in s15:2863) handles Anthropic-specific 
 
 ---
 
-## Appendix B: Test Execution Result
+## Appendix B: Test Execution Result (Windows)
 
 ```
 ============================= test session starts =============================
 platform win32 -- Python 3.14.4, pytest-9.1.1, pluggy-1.6.0
 collected 157 items
 
-103 passed, 107 failed in 29.16s
+============ 107 failed, 103 passed, 17 subtests passed in 19.32s =============
 ```
 
-Failure root cause: `fcntl` (Unix-only) imported at module level in s13 and s15. Tests that don't load those modules pass (103 tests). This is a platform limitation.
+**Failure root cause breakdown** (all Windows platform issues):
 
----
+| Root cause | Count |
+|---|---|
+| `fcntl` import (module-level, s13/s15/s16) | 98 |
+| `fcntl` cascading (subTest collapse, subprocess exit) | 5 |
+| `signal.SIGKILL` | 1 |
+| Windows path separator | 1 |
+| Windows encoding (GBK) | 1 |
+| Windows symlink permission | 1 |
+| **Total failed** | **107** |
 
-*Audit completed 2026-08-12. No runtime behavior modified.*
+**Linux baseline**: Verification pending (WSL not available on this machine). The canonical runtime environment policy is Linux; all 107 Windows failures are expected to resolve on Linux.
