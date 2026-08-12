@@ -32,6 +32,7 @@ from agent_runtime.providers.anthropic import (
     _decode_usage,
     _encode_messages,
     _extract_system,
+    _json_safe_boundary,
     _normalize_error,
     _tool_calls_to_blocks,
 )
@@ -387,3 +388,80 @@ def test_complete_with_tool_calls() -> None:
     assert len(response.message.tool_calls) == 1  # type: ignore[arg-type]
     assert response.message.tool_calls[0].name == "bash"  # type: ignore[index]
     assert response.message.tool_calls[0].arguments == {"command": "pwd"}  # type: ignore[index]
+
+
+# ============================================================================
+# _json_safe_boundary tests
+# ============================================================================
+
+class FakeAnthropicFieldInfo:
+    """Simulates a Pydantic FieldInfo — must be dropped by _json_safe_boundary."""
+    def __init__(self, default=None):
+        self.default = default
+
+
+def test_json_safe_boundary_allows_primitives() -> None:
+    assert _json_safe_boundary(None) is None
+    assert _json_safe_boundary(True) is True
+    assert _json_safe_boundary(42) == 42
+    assert _json_safe_boundary(3.14) == 3.14
+    assert _json_safe_boundary("hello") == "hello"
+
+
+def test_json_safe_boundary_drops_internals() -> None:
+    assert _json_safe_boundary(FakeAnthropicFieldInfo()) is None
+    assert _json_safe_boundary(lambda x: x) is None
+    assert _json_safe_boundary(b"bytes") is None
+
+
+def test_json_safe_boundary_recursive() -> None:
+    result = _json_safe_boundary({"a": 1, "b": [2, None], "c": {"d": "keep"}})
+    assert result == {"a": 1, "b": [2, None], "c": {"d": "keep"}}
+
+
+def test_json_safe_boundary_mixed_drops_internals() -> None:
+    result = _json_safe_boundary({
+        "good": 1,
+        "bad": FakeAnthropicFieldInfo(),
+        "nested": [None, FakeAnthropicFieldInfo(), "keep"],
+    })
+    assert result == {"good": 1, "nested": [None, "keep"]}
+
+
+# ============================================================================
+# _decode_usage with Pydantic-like fake SDK object
+# ============================================================================
+
+def _make_anthropic_fake_usage(**overrides) -> MagicMock:
+    """Build a MagicMock that mimics a real Anthropic SDK Usage object."""
+    usage = MagicMock()
+    usage.model_fields = {
+        "input_tokens": FakeAnthropicFieldInfo(default=0),
+        "output_tokens": FakeAnthropicFieldInfo(default=0),
+    }
+    usage.model_config = {"arbitrary_types_allowed": True}
+    usage.model_computed_fields = {}
+
+    usage.input_tokens = overrides.get("input_tokens", 100)
+    usage.output_tokens = overrides.get("output_tokens", 50)
+    usage.cache_read_input_tokens = overrides.get("cache_read_input_tokens", 30)
+    usage.cache_creation_input_tokens = overrides.get("cache_creation_input_tokens", 20)
+    return usage
+
+
+def test_anthropic_decode_usage_drops_pydantic_internals() -> None:
+    usage = _make_anthropic_fake_usage()
+    result = _decode_usage(usage)
+
+    assert result.input_tokens == 100
+    assert result.output_tokens == 50
+    assert result.cache_read_tokens == 30
+    assert result.cache_creation_tokens == 20
+
+    pd = result.provider_details
+    assert "model_fields" not in pd
+    assert "model_config" not in pd
+    assert "model_computed_fields" not in pd
+
+    import json as _json
+    _json.dumps(pd)  # must not raise

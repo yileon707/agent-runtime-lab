@@ -188,44 +188,103 @@ def _decode_finish_reason(stop_reason: str | None) -> FinishReason:
     return _STOP_REASON_MAP.get(stop_reason, FinishReason.UNKNOWN)
 
 
-def _decode_usage(usage: Any) -> TokenUsage:
-    """Map Anthropic usage object to canonical TokenUsage."""
-    provider_details: dict[str, Any] = {}
+def _json_safe_boundary(value: Any) -> Any:
+    """Return a JSON-safe version of *value*, or ``None`` if not convertible.
 
+    Only these types pass through: ``None``, ``bool``, ``int``, ``float``,
+    ``str``, ``list``, ``dict``.  Lists and dicts are recursively filtered;
+    non-convertible elements/values are omitted (not replaced with None).
+    No ``repr()`` is ever called.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        result: list[Any] = []
+        for v in value:
+            if v is None:
+                result.append(None)
+            else:
+                safe = _json_safe_boundary(v)
+                if safe is not None:
+                    result.append(safe)
+        return result
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for k, v in value.items():
+            if isinstance(k, str):
+                safe_v = _json_safe_boundary(v)
+                if safe_v is not None or v is None:
+                    result[k] = safe_v
+        return result
+    # Pydantic model, FieldInfo, callable, bytes, etc. — drop
+    return None
+
+
+def _decode_usage(usage: Any) -> TokenUsage:
+    """Map Anthropic usage object to canonical TokenUsage.
+
+    Only explicitly-named known fields are read from the vendor object.
+    Extra metadata is extracted via ``model_dump()`` (Pydantic v2) when
+    available and filtered through :func:`_json_safe_boundary` — no
+    ``dir()`` iteration, no Pydantic internals leakage.
+    """
     def _safe_int(val: Any) -> int | None:
         if val is None:
             return None
         return int(val)
 
-    # Known canonicalisable fields
+    # -- canonical known fields --
     input_tokens = _safe_int(getattr(usage, "input_tokens", 0)) or 0
     output_tokens = _safe_int(getattr(usage, "output_tokens", 0)) or 0
     cache_read = _safe_int(getattr(usage, "cache_read_input_tokens", None))
     cache_creation = _safe_int(getattr(usage, "cache_creation_input_tokens", None))
 
-    # Stash any additional fields in provider_details for traceability
-    _PYDANTIC_INTERNALS = frozenset({
-        "model_fields", "model_config", "model_computed_fields",
-        "model_extra", "model_fields_set", "model_post_init",
-        "construct", "copy", "dict", "from_orm", "json",
-        "model_validate", "model_validate_json", "parse_file",
-        "parse_obj", "parse_raw", "schema", "schema_json",
-        "update_forward_refs", "validate",
+    _CANONICAL_KEYS = frozenset({
+        "input_tokens", "output_tokens", "total_tokens",
+        "cache_read_input_tokens", "cache_creation_input_tokens",
     })
-    for attr in dir(usage):
-        if attr.startswith("_") or attr in _PYDANTIC_INTERNALS:
-            continue
-        if attr in (
-            "input_tokens", "output_tokens", "total_tokens",
-            "cache_read_input_tokens", "cache_creation_input_tokens",
-        ):
-            continue
+
+    # -- provider_details: use structured serialization when available --
+    provider_details: dict[str, Any] = {}
+    raw_extra: dict[str, Any] | None = None
+
+    model_dump = getattr(usage, "model_dump", None)
+    if callable(model_dump):
         try:
-            val = getattr(usage, attr)
-            if not callable(val) and val is not None:
-                provider_details[attr] = val
+            dumped: Any = model_dump()
+            if isinstance(dumped, dict):
+                raw_extra = dumped
         except Exception:
-            pass
+            raw_extra = None
+
+    if raw_extra is not None:
+        for key, val in raw_extra.items():
+            if key in _CANONICAL_KEYS:
+                continue
+            safe = _json_safe_boundary(val)
+            if safe is not None:
+                provider_details[key] = safe
+    else:
+        _PYDANTIC_BLOCKLIST = frozenset({
+            "model_fields", "model_config", "model_computed_fields",
+            "model_extra", "model_fields_set", "model_post_init",
+        })
+        for attr in dir(usage):
+            if attr.startswith("_") or attr in _PYDANTIC_BLOCKLIST:
+                continue
+            if attr in _CANONICAL_KEYS:
+                continue
+            try:
+                val = getattr(usage, attr)
+                if callable(val):
+                    continue
+                safe = _json_safe_boundary(val)
+                if safe is not None:
+                    provider_details[attr] = safe
+            except Exception:
+                pass
 
     return TokenUsage(
         input_tokens=input_tokens,

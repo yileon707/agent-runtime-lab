@@ -230,48 +230,111 @@ def _build_provider_state(
     )
 
 
+def _json_safe_boundary(value: Any) -> Any:
+    """Return a JSON-safe version of *value*, or ``None`` if not convertible.
+
+    Only these types pass through: ``None``, ``bool``, ``int``, ``float``,
+    ``str``, ``list``, ``dict``.  Lists and dicts are recursively filtered;
+    non-convertible elements/values are omitted (not replaced with None).
+    No ``repr()`` is ever called.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        result: list[Any] = []
+        for v in value:
+            if v is None:
+                result.append(None)
+            else:
+                safe = _json_safe_boundary(v)
+                if safe is not None:
+                    result.append(safe)
+        return result
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for k, v in value.items():
+            if isinstance(k, str):
+                safe_v = _json_safe_boundary(v)
+                if safe_v is not None or v is None:
+                    result[k] = safe_v
+        return result
+    # Pydantic model, FieldInfo, callable, bytes, etc. — drop
+    return None
+
+
 def _decode_usage(usage: Any) -> TokenUsage:
-    """Map DeepSeek/OpenAI usage to canonical TokenUsage."""
+    """Map DeepSeek/OpenAI usage to canonical TokenUsage.
+
+    Only explicitly-named known fields are read from the vendor object.
+    Extra metadata is extracted via ``model_dump()`` (Pydantic v2) when
+    available and filtered through :func:`_json_safe_boundary` — no
+    ``dir()`` iteration, no Pydantic internals leakage.
+    """
     def _s(v: Any) -> int | None:
         return int(v) if v is not None else None
 
+    # -- canonical known fields --
     input_tokens = _s(getattr(usage, "prompt_tokens", 0)) or 0
     output_tokens = _s(getattr(usage, "completion_tokens", 0)) or 0
     total_tokens = _s(getattr(usage, "total_tokens", None))
     cache_read = _s(getattr(usage, "prompt_cache_hit_tokens", None))
     cache_miss = _s(getattr(usage, "prompt_cache_miss_tokens", None))
 
-    # reasoning tokens from completion_tokens_details
     completion_details = getattr(usage, "completion_tokens_details", None)
     reasoning_tokens: int | None = None
     if completion_details is not None:
         reasoning_tokens = _s(getattr(completion_details, "reasoning_tokens", None))
 
-    # Stash non-canonicalisable fields
-    _PYDANTIC_INTERNALS = frozenset({
-        "model_fields", "model_config", "model_computed_fields",
-        "model_extra", "model_fields_set", "model_post_init",
-        "construct", "copy", "dict", "from_orm", "json",
-        "model_validate", "model_validate_json", "parse_file",
-        "parse_obj", "parse_raw", "schema", "schema_json",
-        "update_forward_refs", "validate",
+    # -- provider_details: use structured serialization when available --
+    _CANONICAL_KEYS = frozenset({
+        "prompt_tokens", "completion_tokens", "total_tokens",
+        "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+        "completion_tokens_details",
     })
+
     provider_details: dict[str, Any] = {}
-    for attr in dir(usage):
-        if attr.startswith("_") or attr in _PYDANTIC_INTERNALS:
-            continue
-        if attr in (
-            "prompt_tokens", "completion_tokens", "total_tokens",
-            "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
-            "completion_tokens_details",
-        ):
-            continue
+    raw_extra: dict[str, Any] | None = None
+
+    # Prefer model_dump() (Pydantic v2) — gives a clean JSON-safe dict
+    model_dump = getattr(usage, "model_dump", None)
+    if callable(model_dump):
         try:
-            val = getattr(usage, attr)
-            if not callable(val) and val is not None:
-                provider_details[attr] = val
+            dumped: Any = model_dump()
+            if isinstance(dumped, dict):
+                raw_extra = dumped
         except Exception:
-            pass
+            raw_extra = None
+
+    if raw_extra is not None:
+        # Filter through JSON-safe boundary, exclude known canonical keys
+        for key, val in raw_extra.items():
+            if key in _CANONICAL_KEYS:
+                continue
+            safe = _json_safe_boundary(val)
+            if safe is not None:
+                provider_details[key] = safe
+    else:
+        # Fallback: getattr loop, every value through JSON-safe boundary
+        _PYDANTIC_BLOCKLIST = frozenset({
+            "model_fields", "model_config", "model_computed_fields",
+            "model_extra", "model_fields_set", "model_post_init",
+        })
+        for attr in dir(usage):
+            if attr.startswith("_") or attr in _PYDANTIC_BLOCKLIST:
+                continue
+            if attr in _CANONICAL_KEYS:
+                continue
+            try:
+                val = getattr(usage, attr)
+                if callable(val):
+                    continue
+                safe = _json_safe_boundary(val)
+                if safe is not None:
+                    provider_details[attr] = safe
+            except Exception:
+                pass
 
     return TokenUsage(
         input_tokens=input_tokens,
@@ -279,7 +342,7 @@ def _decode_usage(usage: Any) -> TokenUsage:
         total_tokens=total_tokens,
         reasoning_tokens=reasoning_tokens,
         cache_read_tokens=cache_read,
-        cache_creation_tokens=None,  # DeepSeek doesn't report cache creation separately
+        cache_creation_tokens=None,
         cache_miss_tokens=cache_miss,
         provider_details=provider_details,
     )

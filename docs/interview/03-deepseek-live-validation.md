@@ -70,15 +70,18 @@ All four cases executed via `scripts/smoke_deepseek_provider.py`.
 
 **Severity**: Blocks all live API use.
 
-**Root cause**: `_decode_usage()` in both `deepseek.py` and `anthropic.py` iterates `dir(usage)` on the SDK's internal Pydantic model objects. Pydantic BaseModels expose `model_fields`, `model_config`, `model_computed_fields`, etc. which contain `FieldInfo` objects. These leaked into `provider_details` and caused `json.dumps()` in `TokenUsage.__post_init__` to crash with `TypeError: Object of type FieldInfo is not JSON serializable`.
+**Root cause**: Provider Adapter (`_decode_usage()` in both `deepseek.py` and `anthropic.py`) incorrectly leaked SDK/Pydantic internals across the canonical boundary. The ``dir(usage)`` iteration captured Pydantic BaseModel metadata fields (``model_fields``, ``model_config``, etc.) containing ``FieldInfo`` objects, which are not JSON-serializable. These entered ``TokenUsage.provider_details`` and caused the contract's ``json.dumps()`` guard to crash.
 
-**Fix (two layers)**:
+**Fix**: Provider Adapters now perform explicit, JSON-safe usage extraction:
 
-1. **`agent_runtime/providers/deepseek.py`** — Added `_PYDANTIC_INTERNALS` frozenset to the `_decode_usage` filter loop, excluding all Pydantic model metadata fields.
-2. **`agent_runtime/providers/anthropic.py`** — Same fix applied for future real-Anthropic use.
-3. **`agent_runtime/model/contracts.py`** — `TokenUsage.__post_init__` now catches `TypeError`/`ValueError` from `json.dumps()` instead of crashing. The guard is best-effort — `provider_details` tolerates non-serializable values since they can arrive from SDK internals beyond the adapter's control.
+1. **`agent_runtime/providers/deepseek.py`** — New ``_json_safe_boundary()`` function that only passes through ``None``, ``bool``, ``int``, ``float``, ``str``, ``list``, ``dict``. Non-convertible values are dropped (never ``repr()``'d). ``_decode_usage()`` now uses ``model_dump()`` (Pydantic v2) when available for structured serialization, with a ``dir()`` + ``_PYDANTIC_BLOCKLIST`` fallback. All values pass through the JSON-safe boundary before entering canonical state.
+2. **`agent_runtime/providers/anthropic.py`** — Same ``_json_safe_boundary()`` and ``_decode_usage()`` rewrite.
+3. **`agent_runtime/model/contracts.py`** — ``TokenUsage.__post_init__`` retains its strict ``json.dumps()`` guard. Non-serializable ``provider_details`` are rejected — the fix is in the adapter, not the contract.
 
-**Test impact**: `test_token_usage_provider_details_rejects_non_serialisable` renamed to `test_token_usage_provider_details_tolerates_non_serialisable` — now verifies graceful tolerance, not rejection.
+**Test impact**: 
+- Contract test ``test_token_usage_provider_details_rejects_non_serialisable`` restored to strict rejection behavior.
+- New provider tests verify ``_json_safe_boundary`` allows primitives, recursively filters lists/dicts, drops ``FieldInfo``/callable/bytes.
+- New ``_decode_usage`` tests with Pydantic-like fake SDK objects confirm ``model_fields`` etc. are excluded and ``provider_details`` is JSON-serializable.
 
 ---
 
@@ -95,19 +98,21 @@ No **SDK_COMPATIBILITY** or **DEEPSEEK_PROTOCOL** bugs found — the request enc
 ```
 agent_runtime/
   model/
-    contracts.py          # TokenUsage.__post_init__ tolerates non-serializable provider_details
+    contracts.py          # TokenUsage.__post_init__ strict guard (unchanged from P0.2A.1)
   providers/
-    anthropic.py          # _decode_usage: filter Pydantic model internals
-    deepseek.py           # _decode_usage: filter Pydantic model internals
+    anthropic.py          # _json_safe_boundary + explicit _decode_usage, model_dump() preferred
+    deepseek.py           # _json_safe_boundary + explicit _decode_usage, model_dump() preferred
 
 scripts/
   smoke_deepseek_provider.py   # NEW — live validation script
 
 tests/
-  test_model_provider_contract.py  # renamed test for tolerance behavior
+  test_deepseek_provider.py     # +8 tests: _json_safe_boundary, _decode_usage with Pydantic fake
+  test_anthropic_provider.py    # +5 tests: _json_safe_boundary, _decode_usage with Pydantic fake
+  test_model_provider_contract.py  # restored strict rejection test
 
 docs/interview/
-  03-deepseek-live-validation.md   # this document
+  03-deepseek-live-validation.md   # this document (corrected root cause)
 ```
 
 ---

@@ -28,6 +28,7 @@ from agent_runtime.model.provider import (
 from agent_runtime.providers.deepseek import (
     DeepSeekProvider,
     _encode_messages,
+    _json_safe_boundary,
     _normalize_error,
     _tool_call_to_dict,
 )
@@ -635,3 +636,122 @@ def test_tool_call_no_args_or_raw_raises() -> None:
     with pytest.raises(ProviderError) as exc:
         _tool_call_to_dict(tc)
     assert exc.value.kind == ProviderErrorKind.INVALID_REQUEST
+
+
+# ============================================================================
+# 24 — _json_safe_boundary: allows primitives, drops internals
+# ============================================================================
+
+class FakeFieldInfo:
+    """Simulates a Pydantic FieldInfo — must be dropped by _json_safe_boundary."""
+    def __init__(self, default=None):
+        self.default = default
+
+
+def test_json_safe_boundary_allows_primitives() -> None:
+    assert _json_safe_boundary(None) is None
+    assert _json_safe_boundary(True) is True
+    assert _json_safe_boundary(42) == 42
+    assert _json_safe_boundary(3.14) == 3.14
+    assert _json_safe_boundary("hello") == "hello"
+
+
+def test_json_safe_boundary_recursive_list() -> None:
+    result = _json_safe_boundary([1, "a", None, [2, 3]])
+    assert result == [1, "a", None, [2, 3]]
+
+
+def test_json_safe_boundary_recursive_dict() -> None:
+    result = _json_safe_boundary({"a": 1, "b": {"c": "d"}})
+    assert result == {"a": 1, "b": {"c": "d"}}
+
+
+def test_json_safe_boundary_drops_internals() -> None:
+    assert _json_safe_boundary(FakeFieldInfo()) is None
+    assert _json_safe_boundary(lambda x: x) is None
+    assert _json_safe_boundary(b"bytes") is None
+    assert _json_safe_boundary(complex(1, 2)) is None
+
+
+def test_json_safe_boundary_mixed_list_drops_internals() -> None:
+    result = _json_safe_boundary([1, FakeFieldInfo(), "keep", None, object()])
+    assert result == [1, "keep", None]
+
+
+def test_json_safe_boundary_mixed_dict_drops_internals() -> None:
+    result = _json_safe_boundary({
+        "a": 1,
+        "b": FakeFieldInfo(default=42),
+        "c": "keep",
+        "d": None,
+    })
+    assert result == {"a": 1, "c": "keep", "d": None}
+
+
+# ============================================================================
+# 25 — _decode_usage with Pydantic-like fake SDK object
+# ============================================================================
+
+def _make_fake_pydantic_usage(**overrides) -> MagicMock:
+    """Build a MagicMock that mimics a real OpenAI SDK Usage (Pydantic) object.
+
+    Includes ``model_fields`` and ``model_config`` that contain FieldInfo
+    internals — these MUST be dropped by ``_decode_usage``.
+    """
+    usage = MagicMock()
+    # Pydantic internals (must be filtered)
+    usage.model_fields = {
+        "prompt_tokens": FakeFieldInfo(default=0),
+        "completion_tokens": FakeFieldInfo(default=0),
+    }
+    usage.model_config = {"arbitrary_types_allowed": True}
+    usage.model_computed_fields = {}
+    usage.model_post_init = None
+
+    # Canonical fields
+    usage.prompt_tokens = overrides.get("prompt_tokens", 100)
+    usage.completion_tokens = overrides.get("completion_tokens", 50)
+    usage.total_tokens = overrides.get("total_tokens", 150)
+    usage.prompt_cache_hit_tokens = overrides.get("prompt_cache_hit_tokens", 30)
+    usage.prompt_cache_miss_tokens = overrides.get("prompt_cache_miss_tokens", 70)
+
+    completion_details = MagicMock()
+    completion_details.reasoning_tokens = overrides.get("reasoning_tokens", 200)
+    usage.completion_tokens_details = completion_details
+
+    return usage
+
+
+def test_decode_usage_drops_pydantic_internals() -> None:
+    from agent_runtime.providers.deepseek import _decode_usage
+
+    usage = _make_fake_pydantic_usage()
+    result = _decode_usage(usage)
+
+    # Known canonical values correct
+    assert result.input_tokens == 100
+    assert result.output_tokens == 50
+    assert result.total_tokens == 150
+    assert result.cache_read_tokens == 30
+    assert result.cache_miss_tokens == 70
+    assert result.reasoning_tokens == 200
+
+    # provider_details must NOT contain Pydantic internals
+    pd = result.provider_details
+    assert "model_fields" not in pd
+    assert "model_config" not in pd
+    assert "model_computed_fields" not in pd
+    assert "prompt_tokens" not in pd
+    assert "completion_tokens" not in pd
+    assert "total_tokens" not in pd
+
+    # provider_details MUST be JSON-serializable
+    json.dumps(pd)
+
+
+def test_decode_usage_provider_details_json_serializable() -> None:
+    from agent_runtime.providers.deepseek import _decode_usage
+
+    usage = _make_fake_pydantic_usage(prompt_tokens=200, completion_tokens=100)
+    result = _decode_usage(usage)
+    json.dumps(result.provider_details)  # must not raise
