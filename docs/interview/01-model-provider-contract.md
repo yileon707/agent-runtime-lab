@@ -77,9 +77,10 @@ STOP          — model chose to end the turn
 TOOL_CALLS    — model emitted one or more tool calls
 LENGTH        — output hit max limit
 CONTENT_FILTER — safety filter blocked output
-ERROR         — provider returned an error
 UNKNOWN       — unrecognised reason
 ```
+
+**IMPORTANT**: There is **no** ``ERROR`` finish reason. Provider failures are raised as ``ProviderError`` exceptions — this ensures a single error channel. ``FinishReason`` describes *successful* completions only.
 
 These are **normalised** — every adapter translates vendor-specific strings (`"tool_use"`, `"function_call"`, `"max_tokens"`) into these canonical values.
 
@@ -105,7 +106,10 @@ ToolCall(
 )
 ```
 
-The `ToolCall.from_raw_json()` factory is the **single canonical entry point** for constructing tool calls. It guarantees:
+The `ToolCall.from_raw_json()` and `ToolCall.from_arguments()` factories are the **two canonical entry points** for constructing tool calls:
+
+- `from_arguments(call_id, name, arguments: dict)` — for providers that natively return structured dict input (e.g. Anthropic). The dict is **defensively copied** via `copy.deepcopy()` so provider-side mutation cannot affect Runtime state.
+- `from_raw_json(call_id, name, raw_arguments: str | None)` — for providers that return JSON string arguments (e.g. OpenAI / DeepSeek).
 
 - Valid JSON → `arguments` = parsed dict, `argument_error` = None
 - Invalid JSON → `arguments` = None, `raw_arguments` preserved, `argument_error` set
@@ -129,7 +133,9 @@ ProviderState(
 2. Runtime MUST NEVER interpret or depend on any key inside `data`.
 3. `data` MUST be JSON-serialisable (enforced at construction).
 
-**Rationale**: Some providers require replay-critical protocol state (multi-turn conversation IDs, cached-prompt identifiers, reasoning tokens). This state must survive serialisation (e.g., durable task storage) and be returned to the provider on subsequent turns — but it must never leak into Runtime logic. `ProviderState` is a sealed box.
+**Semantic vs Protocol State**: ``ProviderState`` carries **protocol-level** provider state — opaque data the provider needs for replay continuity (multi-turn conversation IDs, cached-prompt identifiers, reasoning tokens). This is distinct from **semantic state** (conversation messages, tool call/result pairs) which lives in ``ModelMessage``. Protocol state is provider-specific and opaque; semantic state is canonical and transparent. Keeping them separate prevents vendor concepts from leaking into Runtime logic.
+
+**Role constraint**: ``provider_state`` is only valid on ``ASSISTANT`` messages. Providers attach replay-critical state to assistant turns (e.g., Anthropic's ``message.id`` or DeepSeek's conversation session identifier). Constructing a ``USER``, ``TOOL``, or ``SYSTEM`` message with ``provider_state`` raises ``ValueError``. This ensures protocol state is always anchored to the turn that produced it.
 
 ### ModelMessage
 
@@ -146,22 +152,29 @@ ModelMessage(
 **Constraints enforced at construction**:
 - `role=TOOL` → `tool_call_id` must be set → enables tool result correlation.
 - `role != ASSISTANT` → `tool_calls` must be empty/None.
+- `role != ASSISTANT` → `provider_state` must be None (protocol state is anchored to assistant turns only).
 - Convenience constructors: `ModelMessage.system()`, `.user()`, `.assistant()`, `.tool()`.
 
 ### TokenUsage
 
 ```python
 TokenUsage(
-    input_tokens=150,        # non-negative
-    output_tokens=50,        # non-negative
-    total_tokens=200,        # optional; derived from input+output if absent
-    cache_read_tokens=None,  # optional, non-negative
-    cache_write_tokens=None, # optional, non-negative
-    reasoning_tokens=None,   # optional, non-negative
+    input_tokens=150,           # non-negative
+    output_tokens=50,           # non-negative
+    total_tokens=200,           # optional; derived from input+output if absent
+    reasoning_tokens=None,      # optional, non-negative
+    cache_read_tokens=None,     # optional, non-negative — tokens read from cache
+    cache_creation_tokens=None, # optional, non-negative — tokens written to cache
+    cache_miss_tokens=None,     # optional, non-negative — cache lookups that missed
+    provider_details={},        # dict — extra usage metadata (must be JSON-serialisable)
 )
 ```
 
-All fields are validated non-negative at construction. This prevents different providers' usage schemas from leaking into Runtime accounting.
+All numeric fields are validated non-negative at construction. This prevents different providers' usage schemas from leaking into Runtime accounting.
+
+**Cache semantics**: ``cache_read_tokens``, ``cache_creation_tokens``, and ``cache_miss_tokens`` are **independent dimensions**. A cache miss is NOT automatically a cache write — providers can report cache misses without writing to cache (e.g., Anthropic's cache hit/miss breakdown vs OpenAI's prompt caching that auto-caches on miss). Adapters must map provider-specific cache fields without conflating these concepts.
+
+**provider_details**: Carries usage metadata that cannot be reliably canonicalised across providers (e.g., Anthropic's ``cache_read_input_tokens`` breakdown, OpenAI's ``prompt_tokens_details``). The Runtime MAY store, trace, or serialise it, but MUST NOT depend on specific keys for core decision-making.
 
 ### ModelRequest / ModelResponse
 
@@ -241,7 +254,10 @@ Different providers report token counts under different attribute names:
 | Input tokens | `usage.input_tokens` | `usage.prompt_tokens` |
 | Output tokens | `usage.output_tokens` | `usage.completion_tokens` |
 | Cache read | `usage.cache_read_input_tokens` | `usage.prompt_tokens_details.cached_tokens` |
-| Reasoning | not available | `usage.completion_tokens_details.reasoning_tokens` |
+| Cache creation | `usage.cache_creation_input_tokens` | auto-cached (implicit) |
+| Cache miss | `cache miss = prompt - cache_read - cache_creation` | N/A (auto-caching) |
+| Reasoning | N/A | `usage.completion_tokens_details.reasoning_tokens` |
+| Provider metadata | `provider_details` (non-canonical) | `provider_details` (non-canonical) |
 
 By normalising into `TokenUsage` now, future Runtime subsystems (cost tracking, context budget, observability) can consume a single vocabulary.
 
@@ -274,24 +290,29 @@ After P0.2B, s15 can be incrementally migrated to use `ModelProvider.complete()`
 
 ## Test Coverage
 
-`tests/test_model_provider_contract.py` — 35 tests covering:
+`tests/test_model_provider_contract.py` — 54 tests covering:
 
 1. Architectural constraint: `agent_runtime.model` does not import `anthropic` or `openai`
 2. Basic conversation construction (system → user → assistant)
 3. Tool call → tool result correlation via `tool_call_id`
 4. Multiple tool calls in one assistant response
 5. Valid tool argument JSON parsing
-6. Malformed tool arguments (invalid JSON, non-dict) — graceful handling
-7. `ProviderState` round-trip serialisation
-8. `TOOL` role without `tool_call_id` → rejected
-9. `USER` message with `tool_calls` → rejected
-10. `ModelResponse.message` not `ASSISTANT` → rejected
-11. `TokenUsage` negative values → rejected
-12. `TokenUsage.total` derivation when absent
-13. `FinishReason` values are vendor-neutral
-14. `ProviderError` retryable semantics
-15. Full `ModelRequest` → `ModelResponse` round-trip
-16. `ToolDefinition`, `ModelRequest`, `ToolCall` validation constraints
+6. Malformed tool arguments (invalid JSON, non-dict, None) — graceful handling
+7. `ToolCall.from_arguments()` with defensive copy (shallow + deep nested)
+8. `ProviderState` round-trip serialisation
+9. `provider_state` ASSISTANT-only: allowed on ASSISTANT, rejected on USER/TOOL/SYSTEM
+10. `TOOL` role without `tool_call_id` → rejected
+11. `USER` message with `tool_calls` → rejected
+12. `ModelResponse.message` not `ASSISTANT` → rejected
+13. `TokenUsage` negative values → rejected (all numeric fields)
+14. `TokenUsage.total` derivation when absent
+15. `TokenUsage` cache fields: `cache_creation_tokens`, `cache_miss_tokens` independent
+16. `TokenUsage.provider_details` — stores extra metadata, JSON-serialisable guard
+17. `FinishReason` values are vendor-neutral
+18. `FinishReason.ERROR` absent — provider failures use `ProviderError` only
+19. `ProviderError` retryable semantics
+20. Full `ModelRequest` → `ModelResponse` round-trip
+21. `ToolDefinition`, `ModelRequest`, `ToolCall` validation constraints
 
 ---
 
@@ -306,7 +327,7 @@ agent_runtime/
     provider.py               # ModelProvider protocol + ProviderError
 
 tests/
-  test_model_provider_contract.py   # 35 tests
+  test_model_provider_contract.py   # 54 tests
 
 docs/interview/
   01-model-provider-contract.md     # this document

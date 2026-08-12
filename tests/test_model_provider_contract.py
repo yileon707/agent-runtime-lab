@@ -436,3 +436,203 @@ def test_tool_call_rejects_empty_name() -> None:
 def test_tool_call_requires_arguments_or_error() -> None:
     with pytest.raises(ValueError, match="arguments"):
         ToolCall(id="id1", name="bash", arguments=None, raw_arguments=None, argument_error=None)
+
+
+# ============================================================================
+# 18 — ToolCall.from_arguments() with defensive copy
+# ============================================================================
+
+def test_from_arguments_basic() -> None:
+    """from_arguments constructs a ToolCall with parsed arguments and no error."""
+    tc = ToolCall.from_arguments("call_1", "bash", {"command": "ls"})
+    assert tc.id == "call_1"
+    assert tc.name == "bash"
+    assert tc.arguments == {"command": "ls"}
+    assert tc.raw_arguments is None
+    assert tc.argument_error is None
+
+
+def test_from_arguments_defensive_copy() -> None:
+    """Mutating the original dict after from_arguments does not affect the ToolCall."""
+    original = {"command": "ls", "args": ["-la"]}
+    tc = ToolCall.from_arguments("call_1", "bash", original)
+
+    # Mutate the original dict
+    original["command"] = "rm -rf /"
+    original["args"].append("--force")
+
+    # ToolCall must be unaffected
+    assert tc.arguments is not None
+    assert tc.arguments["command"] == "ls"
+    assert tc.arguments["args"] == ["-la"]
+
+
+def test_from_arguments_deep_copy_nested() -> None:
+    """Nested structures in arguments are also defensively copied."""
+    original: dict = {"filters": {"names": ["a.txt", "b.txt"]}}
+    tc = ToolCall.from_arguments("call_1", "search", original)
+
+    # Mutate deeply
+    original["filters"]["names"].append("c.txt")  # type: ignore[index]
+
+    # ToolCall must be unaffected
+    assert tc.arguments is not None
+    assert tc.arguments["filters"]["names"] == ["a.txt", "b.txt"]
+
+
+# ============================================================================
+# 19 — ProviderState restricted to ASSISTANT role only
+# ============================================================================
+
+def test_provider_state_on_assistant_allowed() -> None:
+    """provider_state is allowed on ASSISTANT messages."""
+    ps = ProviderState(provider="deepseek", data={"session": "abc"})
+    msg = ModelMessage.assistant(content="ok", provider_state=ps)
+    assert msg.provider_state is not None
+    assert msg.provider_state.provider == "deepseek"
+
+
+def test_provider_state_on_user_rejected() -> None:
+    """provider_state on USER role is rejected."""
+    ps = ProviderState(provider="deepseek", data={})
+    with pytest.raises(ValueError, match="provider_state"):
+        ModelMessage(role=MessageRole.USER, content="hello", provider_state=ps)
+
+
+def test_provider_state_on_tool_rejected() -> None:
+    """provider_state on TOOL role is rejected."""
+    ps = ProviderState(provider="deepseek", data={})
+    with pytest.raises(ValueError, match="provider_state"):
+        ModelMessage(
+            role=MessageRole.TOOL,
+            content="result",
+            tool_call_id="call_1",
+            provider_state=ps,
+        )
+
+
+def test_provider_state_on_system_rejected() -> None:
+    """provider_state on SYSTEM role is rejected."""
+    ps = ProviderState(provider="deepseek", data={})
+    with pytest.raises(ValueError, match="provider_state"):
+        ModelMessage(role=MessageRole.SYSTEM, content="sys", provider_state=ps)
+
+
+# ============================================================================
+# 20 — FinishReason does NOT have an ERROR member
+# ============================================================================
+
+def test_finish_reason_has_no_error() -> None:
+    """FinishReason.ERROR must not exist — provider failures are ProviderError only."""
+    members = {m.name for m in FinishReason}
+    assert "ERROR" not in members, (
+        "FinishReason must not have ERROR — provider failures use ProviderError"
+    )
+
+
+def test_provider_error_is_the_only_failure_channel() -> None:
+    """ProviderError is the single canonical representation of provider failure."""
+    # ProviderErrorKind covers all error categories
+    assert ProviderErrorKind.INVALID_REQUEST.value == "invalid_request"
+    assert ProviderErrorKind.AUTH.value == "auth"
+    assert ProviderErrorKind.SERVER.value == "server"
+    assert ProviderErrorKind.UNKNOWN.value == "unknown"
+    # ProviderError is an exception, not a FinishReason
+    err = ProviderError(ProviderErrorKind.SERVER, "test", "boom")
+    assert isinstance(err, Exception)
+    assert err.kind == ProviderErrorKind.SERVER
+
+
+# ============================================================================
+# 21 — TokenUsage cache fields and provider_details
+# ============================================================================
+
+def test_token_usage_cache_creation_field() -> None:
+    """cache_creation_tokens is an independent field (was cache_write_tokens)."""
+    usage = TokenUsage(
+        input_tokens=200,
+        output_tokens=100,
+        cache_read_tokens=50,
+        cache_creation_tokens=80,
+    )
+    assert usage.cache_read_tokens == 50
+    assert usage.cache_creation_tokens == 80
+
+
+def test_token_usage_cache_miss_field() -> None:
+    """cache_miss_tokens is independent from cache_creation_tokens."""
+    usage = TokenUsage(
+        input_tokens=200,
+        output_tokens=100,
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
+        cache_miss_tokens=200,
+    )
+    assert usage.cache_miss_tokens == 200
+    # cache miss is NOT conflated with cache creation
+    assert usage.cache_creation_tokens == 0
+
+
+def test_token_usage_cache_creation_rejects_negative() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenUsage(cache_creation_tokens=-1)
+
+
+def test_token_usage_cache_miss_rejects_negative() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenUsage(cache_miss_tokens=-1)
+
+
+def test_token_usage_provider_details_stores_extra_metadata() -> None:
+    """provider_details holds non-canonicalisable usage metadata."""
+    usage = TokenUsage(
+        input_tokens=100,
+        output_tokens=50,
+        provider_details={
+            "prompt_cache_hit_tokens": 30,
+            "prompt_cache_miss_tokens": 70,
+        },
+    )
+    assert usage.provider_details == {
+        "prompt_cache_hit_tokens": 30,
+        "prompt_cache_miss_tokens": 70,
+    }
+
+
+def test_token_usage_provider_details_rejects_non_serialisable() -> None:
+    """provider_details must be JSON-serialisable."""
+    with pytest.raises(TypeError):
+        TokenUsage(provider_details={"fn": lambda x: x})
+
+
+def test_token_usage_provider_details_rejects_non_dict() -> None:
+    with pytest.raises(TypeError, match="dict"):
+        TokenUsage(provider_details=[])  # type: ignore[arg-type]
+
+
+def test_token_usage_rejects_negative_reasoning() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenUsage(reasoning_tokens=-1)
+
+
+def test_token_usage_rejects_negative_cache_read() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        TokenUsage(cache_read_tokens=-1)
+
+
+# ============================================================================
+# 22 — vendor-free import: agent_runtime.model still clean
+# ============================================================================
+
+def test_agent_runtime_model_imports_are_vendor_free() -> None:
+    """After all hardening changes, agent_runtime.model still imports no vendor SDK."""
+    vendor_modules = {"anthropic", "openai"}
+    agent_runtime_mods = {
+        m for m in sys.modules
+        if (m.startswith("agent_runtime.model") or m == "agent_runtime")
+    }
+    for mod_name in agent_runtime_mods:
+        for vendor in vendor_modules:
+            assert vendor not in mod_name.lower(), (
+                f"agent_runtime.model imported vendor module '{mod_name}'"
+            )

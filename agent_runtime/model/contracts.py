@@ -14,6 +14,7 @@ Design principles:
 
 from __future__ import annotations
 
+import copy
 import enum
 import json
 from dataclasses import dataclass, field
@@ -47,13 +48,16 @@ class FinishReason(str, enum.Enum):
 
     Every provider adapter is responsible for translating its vendor-specific
     ``stop_reason`` / ``finish_reason`` into one of these canonical values.
+
+    **Error model**: ``FinishReason`` describes *successful* completions
+    only.  Provider failures are raised as ``ProviderError`` — there is no
+    ``ERROR`` finish reason.  This ensures a single error channel.
     """
 
     STOP = "stop"                 # model chose to end the turn (natural stop)
     TOOL_CALLS = "tool_calls"     # model emitted one or more tool calls
     LENGTH = "length"             # output hit max_tokens / max_output limit
     CONTENT_FILTER = "content_filter"  # provider safety filter blocked output
-    ERROR = "error"               # provider returned an error response
     UNKNOWN = "unknown"           # unrecognised / unhandled reason
 
 
@@ -114,6 +118,30 @@ class ToolCall:
             raise TypeError("ToolCall.arguments must be a dict or None")
 
     @classmethod
+    def from_arguments(
+        cls,
+        call_id: str,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> "ToolCall":
+        """Construct from an already-parsed dict (e.g. Anthropic-style input).
+
+        The arguments dict is **defensively copied** so that provider-side
+        mutation cannot affect Runtime state.
+
+        This path is for providers that natively return structured tool
+        input.  Adapters MUST NOT ``json.dumps() → json.loads()``
+        round-trip an already-parsed dict — use ``from_arguments()``.
+        """
+        return cls(
+            id=call_id,
+            name=name,
+            arguments=copy.deepcopy(arguments),
+            raw_arguments=None,
+            argument_error=None,
+        )
+
+    @classmethod
     def from_raw_json(
         cls,
         call_id: str,
@@ -122,10 +150,12 @@ class ToolCall:
     ) -> "ToolCall":
         """Parse raw JSON arguments; return a ToolCall that never crashes.
 
-        This is the **single canonical factory** for tool calls coming from
-        a provider.  Every adapter should route through here so that the
-        runtime sees a consistent shape regardless of which vendor produced
-        the call.
+        This is the canonical factory for providers that return tool
+        arguments as JSON strings (e.g. OpenAI / DeepSeek).
+
+        Every provider adapter should route through one of the two
+        factories — ``from_arguments()`` or ``from_raw_json()`` — so that
+        the Runtime sees a consistent ``ToolCall`` shape.
         """
         if raw_arguments is None:
             return cls(
@@ -230,6 +260,13 @@ class ModelMessage:
                 f"ModelMessage with role={self.role.value} cannot carry tool_calls"
             )
 
+        # -- Only ASSISTANT may carry provider_state --
+        if self.role != MessageRole.ASSISTANT and self.provider_state is not None:
+            raise ValueError(
+                f"ModelMessage with role={self.role.value} cannot carry provider_state "
+                f"(provider_state is replay-critical assistant protocol state)"
+            )
+
         # -- Guard content type --
         if self.content is not None and not isinstance(self.content, str):
             raise TypeError("ModelMessage.content must be str or None")
@@ -281,22 +318,34 @@ class TokenUsage:
     ``input_tokens + output_tokens`` via the ``total`` property.
 
     No field may be negative.
+
+    **Cache semantics**: ``cache_read_tokens``, ``cache_creation_tokens``,
+    and ``cache_miss_tokens`` are independent dimensions — a cache miss is
+    NOT automatically a cache write.  Adapters must map provider-specific
+    cache fields without conflating these concepts.
+
+    ``provider_details`` carries usage metadata that cannot be reliably
+    canonicalised across providers.  The Runtime MAY store, trace, or
+    serialise it, but MUST NOT depend on specific keys for core control.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int | None = None
-    cache_read_tokens: int | None = None
-    cache_write_tokens: int | None = None
     reasoning_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+    provider_details: dict[str, Any] = field(default_factory=dict)
 
     _NON_NEGATIVE = (
         "input_tokens",
         "output_tokens",
         "total_tokens",
-        "cache_read_tokens",
-        "cache_write_tokens",
         "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "cache_miss_tokens",
     )
 
     def __post_init__(self) -> None:
@@ -304,6 +353,10 @@ class TokenUsage:
             value = getattr(self, attr)
             if value is not None and value < 0:
                 raise ValueError(f"TokenUsage.{attr} must be non-negative, got {value}")
+        if not isinstance(self.provider_details, dict):
+            raise TypeError("TokenUsage.provider_details must be a dict")
+        # Guard: provider_details must be JSON-serialisable
+        json.dumps(self.provider_details)
 
     @property
     def total(self) -> int:
