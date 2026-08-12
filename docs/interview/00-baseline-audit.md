@@ -21,7 +21,7 @@
 | **Test command** | `python -m pytest tests/ -q --tb=short` |
 | **Tests collected** | 157 |
 | **Passed** | 103 |
-| **Failed** | 107 |
+| **Failed** | 107 (88 unique test cases; subTest entries account for the difference) |
 | **Skipped** | 0 |
 | **Errors** | 0 (all failures are assertion/import errors within test execution) |
 | **xfailed/xpassed** | 0 / 0 |
@@ -38,17 +38,18 @@ Tests were executed on **Windows 10 Enterprise LTSC 2019**. WSL is not installed
 
 ### 1.2 Failure Taxonomy (Windows)
 
-All 107 failures are caused by Windows platform incompatibility. **There are zero logic or assertion failures** — every failure traces to a platform API unavailable on Windows.
+All 88 failing test cases (reported as 107 pytest failures due to subTest accounting) are caused by Windows platform incompatibility. The JUnit-verified breakdown:
 
-| Root Cause | Failures | Root Cause Location | Affected Modules |
+| Root Cause | Test Cases | Root Cause Location | Affected Modules |
 |---|---|---|---|
-| `fcntl` import (Unix-only) | 98 | `s13_agent_teams/code.py:23`, `s15_integrated_harness/code.py:23`, `s16_workflow_runtime/code.py:22` | s13, s15, s16 — any test that loads these modules |
-| `fcntl` cascading (subTest collapse, subprocess exit) | 5 | Same as above, secondary effects | test_agent_teams_runtime, test_background_tasks, test_workflow_goal_lessons |
-| `signal.SIGKILL` not on Windows | 1 | `s11_background_tasks/code.py:58` | s11 background task process termination |
-| Windows path separator (`\` vs `/`) | 1 | `test_goal_loop.py:520` — `glob` returns backslash paths on Windows | s17 goal_loop glob tool |
-| Windows encoding (GBK default) | 1 | `test_chapter_readmes.py:27` — `Path.read_text()` uses system ANSI codepage | Chapter README encoding check |
-| Windows symlink requires admin | 1 | `test_task_system.py:152` — `os.symlink()` needs elevation | Task system symlink rejection test |
-| **Total** | **107** | | |
+| `fcntl` import (Unix-only) | 80 | `s13_agent_teams/code.py:23`, `s15_integrated_harness/code.py:23`, `s16_workflow_runtime/code.py:22` | s13, s15, s16 — any test that loads these modules |
+| `signal.SIGKILL` not on Windows | 2 | `s11_background_tasks/code.py:58` | s11 background task process termination; s15 integrated harness SIGKILL usage |
+| Assertion / platform interaction | 3 | Signal handling test (`test_sigterm_stops_active_shell_process_groups`), timing-sensitive wait_until (`test_completed_result_is_collected_once_before_a_later_llm_call`), path separator (`test_goal_loop_file_tools_use_the_current_repository`) | test_agent_teams_runtime, test_background_tasks, test_goal_loop |
+| Windows encoding (GBK default) | 1 | `test_chapter_readmes.py` — `Path.read_text()` uses system ANSI codepage | Chapter README encoding check |
+| Windows symlink requires admin | 1 | `test_task_system.py` — `os.symlink()` needs elevation | Task system symlink rejection test |
+| Subprocess / workflow | 1 | `test_workflow_runtime_resumes_from_journal` — subprocess exit code | test_workflow_goal_lessons |
+| **Total (JUnit test cases)** | **88** | | |
+| **Total (pytest summary, incl. subTest)** | **107** | | |
 
 **Platform failures by module**:
 
@@ -464,16 +465,17 @@ collected 157 items
 ============ 107 failed, 103 passed, 17 subtests passed in 19.32s =============
 ```
 
-**Failure root cause breakdown** (all Windows platform issues):
+**Failure root cause breakdown** (JUnit-verified, all Windows platform issues):
 
-| Root cause | Count |
+| Root cause | Test Cases |
 |---|---|
-| `fcntl` import (module-level, s13/s15/s16) | 98 |
-| `fcntl` cascading (subTest collapse, subprocess exit) | 5 |
-| `signal.SIGKILL` | 1 |
-| Windows path separator | 1 |
+| `fcntl` import (module-level, s13/s15/s16) | 80 |
+| `signal.SIGKILL` not on Windows | 2 |
+| Assertion / platform interaction | 3 |
 | Windows encoding (GBK) | 1 |
 | Windows symlink permission | 1 |
-| **Total failed** | **107** |
+| Subprocess / workflow | 1 |
+| **Total (JUnit test cases)** | **88** |
+| **Total (pytest summary, incl. subTest entries)** | **107** |
 
-**Linux baseline**: Verification pending (WSL not available on this machine). The canonical runtime environment policy is Linux; all 107 Windows failures are expected to resolve on Linux.
+**Linux baseline**: Verification pending (WSL not available on this machine). The canonical runtime environment policy is Linux; all 88 Windows-specific test case failures (reported as 107 including subTest entries) are expected to resolve on Linux.
