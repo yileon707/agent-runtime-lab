@@ -204,8 +204,18 @@ def _decode_usage(usage: Any) -> TokenUsage:
     cache_creation = _safe_int(getattr(usage, "cache_creation_input_tokens", None))
 
     # Stash any additional fields in provider_details for traceability
+    _PYDANTIC_INTERNALS = frozenset({
+        "model_fields", "model_config", "model_computed_fields",
+        "model_extra", "model_fields_set", "model_post_init",
+        "construct", "copy", "dict", "from_orm", "json",
+        "model_validate", "model_validate_json", "parse_file",
+        "parse_obj", "parse_raw", "schema", "schema_json",
+        "update_forward_refs", "validate",
+    })
     for attr in dir(usage):
-        if attr.startswith("_") or attr in (
+        if attr.startswith("_") or attr in _PYDANTIC_INTERNALS:
+            continue
+        if attr in (
             "input_tokens", "output_tokens", "total_tokens",
             "cache_read_input_tokens", "cache_creation_input_tokens",
         ):

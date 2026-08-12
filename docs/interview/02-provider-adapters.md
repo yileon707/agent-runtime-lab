@@ -2,7 +2,7 @@
 
 > **Date**: 2026-08-12
 > **Prerequisite**: [P0.2A.1 — Canonical Contract Hardening](./01-model-provider-contract.md)
-> **Followed by**: P0.2B2 (legacy s15 bridge) or P0.2C (real DeepSeek validation)
+> **Followed by**: [P0.2B1.5 — Live DeepSeek Validation](./03-deepseek-live-validation.md), P0.2B2 (legacy s15 bridge)
 
 ---
 
@@ -15,7 +15,7 @@ The canonical model contract (`agent_runtime/model/`) defines a provider-agnosti
 3. Decode vendor responses into canonical `ModelResponse`.
 4. Normalize vendor errors into `ProviderError`.
 
-This phase delivers two production-ready adapters: **AnthropicProvider** and **DeepSeekProvider**.
+This phase delivers two mock-validated adapters: **AnthropicProvider** and **DeepSeekProvider**.
 
 ---
 
@@ -251,7 +251,7 @@ These are Runtime policy decisions. The adapter's job is translation, not recove
 ## Non-Goals (This Phase)
 
 - **No Legacy s15 Bridge**: Adapters exist independently of the existing runtime.
-- **No Real API Calls**: All tests use fully mocked SDK clients.
+- **No Real API Calls in P0.2B1**: All tests use fully mocked SDK clients.
 - **No Streaming**: Synchronous `complete()` only.
 - **No Async**: Sync-only, matching the current protocol.
 - **No Retry/Backoff/Fallback**: Runtime policy, not provider concern.
@@ -259,7 +259,7 @@ These are Runtime policy decisions. The adapter's job is translation, not recove
 - **No Provider Routing**: Runtime selects which provider to use.
 - **No Tracing/Eval Framework**: Future phases.
 - **No Context Compact modifications**: Unchanged.
-- **DeepSeek is NOT proven runnable yet**: Mock tests only. Real validation is P0.2C.
+- **DeepSeek is mock-validated**: Real API validation completed in [P0.2B1.5](./03-deepseek-live-validation.md).
 
 ---
 

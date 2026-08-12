@@ -248,9 +248,17 @@ def _decode_usage(usage: Any) -> TokenUsage:
         reasoning_tokens = _s(getattr(completion_details, "reasoning_tokens", None))
 
     # Stash non-canonicalisable fields
+    _PYDANTIC_INTERNALS = frozenset({
+        "model_fields", "model_config", "model_computed_fields",
+        "model_extra", "model_fields_set", "model_post_init",
+        "construct", "copy", "dict", "from_orm", "json",
+        "model_validate", "model_validate_json", "parse_file",
+        "parse_obj", "parse_raw", "schema", "schema_json",
+        "update_forward_refs", "validate",
+    })
     provider_details: dict[str, Any] = {}
     for attr in dir(usage):
-        if attr.startswith("_"):
+        if attr.startswith("_") or attr in _PYDANTIC_INTERNALS:
             continue
         if attr in (
             "prompt_tokens", "completion_tokens", "total_tokens",

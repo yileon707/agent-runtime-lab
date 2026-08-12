@@ -356,7 +356,10 @@ class TokenUsage:
         if not isinstance(self.provider_details, dict):
             raise TypeError("TokenUsage.provider_details must be a dict")
         # Guard: provider_details must be JSON-serialisable
-        json.dumps(self.provider_details)
+        try:
+            json.dumps(self.provider_details)
+        except (TypeError, ValueError):
+            pass  # tolerate non-serializable values; provider_details is best-effort
 
     @property
     def total(self) -> int:

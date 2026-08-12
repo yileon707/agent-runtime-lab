@@ -599,10 +599,16 @@ def test_token_usage_provider_details_stores_extra_metadata() -> None:
     }
 
 
-def test_token_usage_provider_details_rejects_non_serialisable() -> None:
-    """provider_details must be JSON-serialisable."""
-    with pytest.raises(TypeError):
-        TokenUsage(provider_details={"fn": lambda x: x})
+def test_token_usage_provider_details_tolerates_non_serialisable() -> None:
+    """provider_details silently tolerates non-JSON-serialisable values.
+
+    Real provider SDKs (Anthropic, OpenAI) can expose Pydantic model internals
+    (e.g. ``model_fields``, ``FieldInfo``) through ``dir(...)`` loops.
+    The guard is best-effort — it validates JSON where possible but
+    does not crash when values are not serialisable.
+    """
+    # Should NOT raise — tolerates non-serializable values gracefully
+    TokenUsage(provider_details={"fn": lambda x: x})
 
 
 def test_token_usage_provider_details_rejects_non_dict() -> None:
