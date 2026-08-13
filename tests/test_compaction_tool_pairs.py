@@ -249,6 +249,72 @@ class CompactionToolPairTests(unittest.TestCase):
                 self.assertEqual(compacted[1:], messages[3:])
                 assert_no_orphan_tool_results(self, compacted)
 
+    def test_s15_compact_history_preserves_completed_tool_turn(self):
+        older = [user_text(), assistant_text(), user_text()]
+        # Assistant turn carries an opaque "thinking"-like block before the
+        # compact tool_use; the whole message must survive verbatim.
+        turn_assistant = {
+            "role": "assistant",
+            "content": [
+                types.SimpleNamespace(type="thinking", thinking="opaque"),
+                types.SimpleNamespace(type="tool_use", id="compact-1", name="compact"),
+            ],
+        }
+        turn_result = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "compact-1",
+                         "content": "[Compaction requested.]"}],
+        }
+        messages = older + [turn_assistant, turn_result]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module("s15_compact_history_under_test", MODULES["s15"], Path(tmp))
+            api = compaction_api(module)
+            api.write_transcript = lambda _messages: Path("transcript.jsonl")
+            captured = {}
+
+            def fake_summarize(passed, _store=captured):
+                _store["messages"] = list(passed)
+                return "summary"
+
+            api.summarize_history = fake_summarize
+            compacted = api.compact_history(list(messages), "the active request")
+
+            # 1. summarize_history receives ONLY the older history, not the tail.
+            self.assertEqual(captured["messages"], older)
+            # 2. compacted[0] is the summary message carrying the active request.
+            self.assertEqual(compacted[0]["role"], "user")
+            self.assertIn("Authoritative request", compacted[0]["content"])
+            self.assertIn("the active request", compacted[0]["content"])
+            # 3. compacted[1] is the EXACT original assistant message (thinking + tool_use).
+            self.assertIs(compacted[1], turn_assistant)
+            # 4. compacted[2] is the EXACT original tool_result message.
+            self.assertIs(compacted[2], turn_result)
+            # 5. no orphan tool_result exists.
+            assert_no_orphan_tool_results(self, compacted)
+
+    def test_s15_compact_history_falls_back_without_completed_tool_turn(self):
+        # History ends with a plain text turn (no tool_use/tool_result pair), so
+        # the anchor is absent; fall back to the single-summary-message behavior.
+        messages = [user_text(), assistant_text(), user_text()]
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module("s15_compact_history_fallback_under_test", MODULES["s15"], Path(tmp))
+            api = compaction_api(module)
+            api.write_transcript = lambda _messages: Path("transcript.jsonl")
+            captured = {}
+
+            def fake_summarize(passed, _store=captured):
+                _store["messages"] = list(passed)
+                return "summary"
+
+            api.summarize_history = fake_summarize
+            compacted = api.compact_history(list(messages), "the active request")
+
+            # Full history is summarized; only the summary message is returned.
+            self.assertEqual(captured["messages"], messages)
+            self.assertEqual(len(compacted), 1)
+            self.assertIn("Authoritative request", compacted[0]["content"])
+
     def test_s15_has_tool_use_still_accepts_content_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module("s15_has_tool_use_under_test", MODULES["s15"], Path(tmp))
