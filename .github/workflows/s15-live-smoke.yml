@@ -1,0 +1,49 @@
+name: s15 Live Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s15-live-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Set up Python
+        # actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run s15 vertical slice (write_file + read_file)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.CANAPI_API_KEY }}
+          ANTHROPIC_BASE_URL: https://canapi.cantonbio.com
+          MODEL_ID: deepseek-v4-pro
+        run: |
+          printf '%s\n%s\n' \
+            "Using ONLY the write_file and read_file tools (never bash), write the exact string 'hello stable agent' to a file named agent_v0_probe.txt, then read that file back with read_file. Finish with a one-line answer stating the exact content you read." \
+            "q" \
+            | python -u s15_integrated_harness/code.py
+
+      - name: Verify probe file content
+        run: |
+          if [ "$(cat agent_v0_probe.txt 2>/dev/null)" = "hello stable agent" ]; then
+            echo "PASS: agent_v0_probe.txt contains 'hello stable agent'"
+          else
+            echo "FAIL: agent_v0_probe.txt missing or incorrect"
+            exit 1
+          fi
+
+      - name: Cleanup probe file
+        if: always()
+        run: rm -f agent_v0_probe.txt
