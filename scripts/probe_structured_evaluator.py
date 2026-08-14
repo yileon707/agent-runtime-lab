@@ -64,6 +64,24 @@ PROMPT = (
 )
 
 
+def _dump_content(response) -> None:
+    """Print block types + truncated payloads (no secrets, no reasoning)."""
+    blocks = list(response.content or [])
+    print(f"raw content block count: {len(blocks)}")
+    for i, b in enumerate(blocks):
+        btype = getattr(b, "type", None)
+        if btype == "text":
+            text = getattr(b, "text", "") or ""
+            print(f"  [{i}] type=text text={text[:300]!r}")
+        elif btype == "tool_use":
+            print(
+                f"  [{i}] type=tool_use name={getattr(b, 'name', None)!r} "
+                f"input={json.dumps(getattr(b, 'input', None), ensure_ascii=False)}"
+            )
+        else:
+            print(f"  [{i}] type={btype!r} keys={list(getattr(b, '__dict__', {}).keys())}")
+
+
 def _extract_tool_use(response) -> dict:
     """Return {"ok":..., "input":...} or raise."""
     blocks = list(response.content or [])
@@ -93,22 +111,30 @@ def _validate_input(data) -> tuple[bool, str]:
     return True, "valid"
 
 
-def run_case(label: str, client: Anthropic, extra: dict) -> bool:
+def run_case(
+    label: str,
+    client: Anthropic,
+    extra: dict,
+    tool_choice: dict | None = None,
+) -> bool:
     print(f"\n===== {label} =====")
+    kwargs: dict = {
+        "model": MODEL,
+        "system": SYSTEM,
+        "messages": [{"role": "user", "content": PROMPT}],
+        "tools": [REPORT_TOOL],
+        "max_tokens": 512,
+        **extra,
+    }
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
     try:
-        resp = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=[{"role": "user", "content": PROMPT}],
-            tools=[REPORT_TOOL],
-            tool_choice={"type": "tool", "name": "report_goal_status"},
-            max_tokens=512,
-            **extra,
-        )
+        resp = client.messages.create(**kwargs)
     except Exception as exc:
         print(f"FAIL: request raised {type(exc).__name__}: {exc}")
         return False
 
+    _dump_content(resp)
     info = _extract_tool_use(resp)
     print(f"stop_reason: {info['stop_reason']}")
     if info.get("tool_use") is None:
@@ -128,20 +154,33 @@ def run_case(label: str, client: Anthropic, extra: dict) -> bool:
 
 def main() -> int:
     client = Anthropic(base_url=BASE_URL)
+    forced = {"type": "tool", "name": "report_goal_status"}
     results = []
 
-    results.append(run_case("CASE A — forced tool, no thinking param", client, {}))
+    results.append(
+        run_case("CASE A — forced tool, no thinking param", client, {}, tool_choice=forced)
+    )
     results.append(
         run_case(
             "CASE B — forced tool, thinking disabled",
             client,
             {"thinking": {"type": "disabled"}},
+            tool_choice=forced,
+        )
+    )
+    results.append(
+        run_case(
+            "CASE C — tool offered, NOT forced, thinking disabled",
+            client,
+            {"thinking": {"type": "disabled"}},
+            tool_choice=None,
         )
     )
 
     print("\n===== PROBE SUMMARY =====")
-    print(f"A (baseline):       {'PASS' if results[0] else 'FAIL'}")
-    print(f"B (thinking off):   {'PASS' if results[1] else 'FAIL'}")
+    print(f"A (forced, thinking on):  {'PASS' if results[0] else 'FAIL'}")
+    print(f"B (forced, thinking off): {'PASS' if results[1] else 'FAIL'}")
+    print(f"C (offered, thinking off):{'PASS' if results[2] else 'FAIL'}")
     if all(results):
         print("PROBE PASS")
         return 0
