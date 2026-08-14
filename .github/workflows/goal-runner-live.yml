@@ -1,0 +1,56 @@
+name: Goal Runner Live
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  goal-runner-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Set up Python
+        # actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The task only mentions phase-1, so the first s15 worker turn can only
+      # write "phase-1" and stop. The goal (seen only by the evaluator) requires
+      # "phase-1" + "phase-2", forcing a BLOCK decision that resumes s15 for a
+      # second cycle.
+      - name: Run goal runner (live multi-cycle)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.CANAPI_API_KEY }}
+          ANTHROPIC_BASE_URL: https://canapi.cantonbio.com
+          MODEL_ID: deepseek-v4-pro
+        run: |
+          python -u agent_operator.py \
+            --task "Using only the write_file tool, create a file named operator_probe.txt containing the single line phase-1. Perform exactly one tool action, then stop and do nothing else." \
+            --goal "The file operator_probe.txt exists and contains two lines: the first line is exactly phase-1 and the second line is exactly phase-2, and the conversation transcript shows read_file output confirming this exact two-line content." \
+            --max-iterations 8
+
+      - name: Verify goal runner outcome
+        if: always()
+        run: |
+          expected=$(printf 'phase-1\nphase-2')
+          actual=$(cat operator_probe.txt 2>/dev/null)
+          if [ "$actual" = "$expected" ]; then
+            echo "PASS: operator_probe.txt contains phase-1 + phase-2"
+          else
+            echo "FAIL: expected [$(printf '%s' "$expected" | sed 's/$/\\n/')], got [$actual]"
+            exit 1
+          fi
+
+      - name: Cleanup probe file
+        if: always()
+        run: rm -f operator_probe.txt
