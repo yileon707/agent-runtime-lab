@@ -2,6 +2,8 @@ name: Goal Runner Live
 
 on:
   workflow_dispatch:
+  push:
+    branches: [fix/operator-structured-evaluator]
 
 permissions:
   contents: read
