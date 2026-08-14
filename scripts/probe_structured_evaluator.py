@@ -91,6 +91,7 @@ def _extract_tool_use(response) -> dict:
     block = tool_uses[0]
     return {
         "stop_reason": response.stop_reason,
+        "tool_use": block,
         "tool_name": getattr(block, "name", None),
         "input": getattr(block, "input", None),
         "tool_use_count": len(tool_uses),
