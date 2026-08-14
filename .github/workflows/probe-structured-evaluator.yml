@@ -1,0 +1,33 @@
+name: Probe Structured Evaluator
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/operator-structured-evaluator]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Set up Python
+        # actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.CANAPI_API_KEY }}
+          ANTHROPIC_BASE_URL: https://canapi.cantonbio.com
+          MODEL_ID: deepseek-v4-pro
+        run: python -u scripts/probe_structured_evaluator.py
