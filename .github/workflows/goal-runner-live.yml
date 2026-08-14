@@ -2,6 +2,11 @@ name: Goal Runner Live
 
 on:
   workflow_dispatch:
+  # Temporary push trigger: GitHub only exposes workflow_dispatch for workflows
+  # already on the default branch, so this lets the feature branch self-validate
+  # before the product is merged. Remove once the branch is merged.
+  push:
+    branches: [feat/autonomous-goal-runner]
 
 permissions:
   contents: read
