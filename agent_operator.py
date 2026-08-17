@@ -226,6 +226,40 @@ def load_goal():
     )
 
 
+_observer = None
+
+
+def _load_observer():
+    """Load agent_observer once, sharing the instance s15 loaded (if any).
+
+    The observer must be a single module instance shared by the operator (Run/
+    Cycle events) and s15 (Iteration events), otherwise a registered observer
+    would only ever see half the lifecycle. Both sides therefore look up
+    ``sys.modules["agent_observer"]`` first and fall back to loading by path.
+    Any failure to load is swallowed so tracing can never break the run.
+    """
+    global _observer
+    if _observer is not None:
+        return _observer
+    try:
+        existing = sys.modules.get("agent_observer")
+        if existing is not None:
+            _observer = existing
+            return existing
+        spec = importlib.util.spec_from_file_location(
+            "agent_observer", str(REPO_ROOT / "agent_observer.py")
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["agent_observer"] = module
+        spec.loader.exec_module(module)
+        _observer = module
+    except Exception:
+        _observer = None
+    return _observer
+
+
 def run_goal_loop(
     worker: Callable[[list, dict, str], None],
     set_goal: Callable[[str], None],
@@ -241,57 +275,102 @@ def run_goal_loop(
         s15.agent_loop) and returns None.
     set_goal(goal): arms the goal controller.
     evaluate(history) -> object with `.action` and `.reason` (StopDecision).
+
+    Emits RunStart/RunEnd and one CycleStart/CycleEnd per worker call when an
+    observer is registered. The observer is fire-and-forget and can never alter
+    the returned OperatorResult or the control flow.
     """
     if max_iterations < 1:
         raise ValueError("max_iterations must be at least 1")
     context = {} if context is None else context
 
+    observer = _load_observer()
+    run_id = None
+    if observer is not None:
+        run_id = observer.begin_run()
+        observer.emit_observer(observer.make_event("RunStart", run_id=run_id))
+
     set_goal(goal)
     history = [{"role": "user", "content": task}]
 
     result = OperatorResult(status="failure")
-    for iteration in range(1, max_iterations + 1):
-        worker(history, context, task)
-        result.worker_cycles += 1
+    try:
+        for iteration in range(1, max_iterations + 1):
+            cycle_id = None
+            if observer is not None:
+                cycle_id = observer.begin_cycle()
+                observer.emit_observer(
+                    observer.make_event(
+                        "CycleStart", run_id=run_id, cycle_id=cycle_id
+                    )
+                )
+            try:
+                worker(history, context, task)
+                result.worker_cycles += 1
+            finally:
+                if observer is not None:
+                    observer.emit_observer(
+                        observer.make_event(
+                            "CycleEnd", run_id=run_id, cycle_id=cycle_id
+                        )
+                    )
+                    observer.end_cycle()
 
-        decision = evaluate(history)
-        result.evaluations += 1
-        result.last_action = decision.action
+            decision = evaluate(history)
+            result.evaluations += 1
+            result.last_action = decision.action
 
-        if decision.action == "achieved":
-            result.status = "success"
-            result.iterations = iteration
-            result.reason = decision.reason
-            return result
+            if decision.action == "achieved":
+                result.status = "success"
+                result.iterations = iteration
+                result.reason = decision.reason
+                break
 
-        if decision.action in ("failed", "limit"):
-            result.status = "failure"
-            result.iterations = iteration
-            result.reason = decision.reason or (
-                f"goal not achieved (action={decision.action})"
+            if decision.action in ("failed", "limit"):
+                result.status = "failure"
+                result.iterations = iteration
+                result.reason = decision.reason or (
+                    f"goal not achieved (action={decision.action})"
+                )
+                break
+
+            if decision.action == "error":
+                result.status = "error"
+                result.iterations = iteration
+                result.reason = decision.reason or "goal evaluator raised an error"
+                break
+
+            # "block" (unfinished) — and defensively "allow"/"defer" — continue.
+            if decision.action == "block":
+                result.blocks += 1
+            history.append(
+                {
+                    "role": "user",
+                    "content": CONTINUATION_TEMPLATE.format(
+                        reason=decision.reason or "(no evaluator reason)"
+                    ),
+                }
             )
-            return result
-
-        if decision.action == "error":
-            result.status = "error"
-            result.iterations = iteration
-            result.reason = decision.reason or "goal evaluator raised an error"
-            return result
-
-        # "block" (unfinished) — and defensively "allow"/"defer" — continue.
-        if decision.action == "block":
-            result.blocks += 1
-        history.append(
-            {
-                "role": "user",
-                "content": CONTINUATION_TEMPLATE.format(
-                    reason=decision.reason or "(no evaluator reason)"
-                ),
-            }
-        )
-
-    result.iterations = max_iterations
-    result.reason = f"goal not achieved after {max_iterations} iteration(s)"
+        else:
+            result.iterations = max_iterations
+            result.reason = f"goal not achieved after {max_iterations} iteration(s)"
+    finally:
+        if observer is not None:
+            observer.emit_observer(
+                observer.make_event(
+                    "RunEnd",
+                    run_id=run_id,
+                    attributes={
+                        "status": result.status,
+                        "iterations": result.iterations,
+                        "worker_cycles": result.worker_cycles,
+                        "evaluations": result.evaluations,
+                        "blocks": result.blocks,
+                        "reason": result.reason,
+                    },
+                )
+            )
+            observer.end_run()
     return result
 
 

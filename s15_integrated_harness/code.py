@@ -29,6 +29,7 @@ import re
 import secrets
 import signal
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -94,6 +95,34 @@ def load_memory_runtime():
 
 
 MEMORY_RUNTIME = load_memory_runtime()
+
+
+def _load_observer_module():
+    """Load the shared agent_observer module once (TRACE V0.1a).
+
+    Reuses the instance already registered in sys.modules["agent_observer"] if
+    the operator (or a test) loaded it first, otherwise loads it by path. This
+    guarantees s15's Iteration events share one observer instance with the
+    operator's Run/Cycle events. Any failure is swallowed: tracing must never
+    break the runtime.
+    """
+    try:
+        existing = sys.modules.get("agent_observer")
+        if existing is not None:
+            return existing
+        path = Path(__file__).resolve().parents[1] / "agent_observer.py"
+        spec = importlib.util.spec_from_file_location("agent_observer", str(path))
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["agent_observer"] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+OBSERVER = _load_observer_module()
 
 
 class ConsoleBroker:
@@ -2887,6 +2916,37 @@ def call_llm(messages: list, context: dict, tools: list,
         state)
 
 
+def _iteration_begin():
+    """Emit IterationStart for this pass through the agent loop (TRACE V0.1a).
+
+    Returns the allocated iteration_id (or None with no active cycle / no
+    observer). Fire-and-forget: never raises, never affects the loop.
+    """
+    if OBSERVER is None:
+        return None
+    iteration_id = OBSERVER.next_iteration_id()
+    OBSERVER.emit_observer(OBSERVER.make_event(
+        "IterationStart",
+        run_id=OBSERVER.current_run_id(),
+        cycle_id=OBSERVER.current_cycle_id(),
+        iteration_id=iteration_id,
+    ))
+    return iteration_id
+
+
+def _iteration_end(iteration_id, exit_label):
+    """Emit IterationEnd for this pass. Fire-and-forget: never raises."""
+    if OBSERVER is None:
+        return
+    OBSERVER.emit_observer(OBSERVER.make_event(
+        "IterationEnd",
+        run_id=OBSERVER.current_run_id(),
+        cycle_id=OBSERVER.current_cycle_id(),
+        iteration_id=iteration_id,
+        attributes={"exit": exit_label},
+    ))
+
+
 def agent_loop(messages: list, context: dict, active_request: str):
     global rounds_since_todo
     tools, handlers = assemble_tool_pool()
@@ -2895,6 +2955,7 @@ def agent_loop(messages: list, context: dict, active_request: str):
 
     unacknowledged_cron_jobs: list[CronJob] = []
     while True:
+        iteration_id = _iteration_begin()
         # One cycle: inject scheduled/background work, prepare context, call
         # the model, execute tool_use blocks, append tool_results, repeat.
         fired = consume_cron_queue()
@@ -2925,10 +2986,12 @@ def agent_loop(messages: list, context: dict, active_request: str):
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages, active_request)
                 state.has_attempted_reactive_compact = True
+                _iteration_end(iteration_id, "reactive_compact")
                 continue
             restore_cron_jobs(unacknowledged_cron_jobs)
             messages.append({"role": "assistant", "content": [
                 {"type": "text", "text": f"[Error] {type(e).__name__}: {e}"}]})
+            _iteration_end(iteration_id, "error")
             release_completed_assignment("agent")
             return
 
@@ -2940,12 +3003,15 @@ def agent_loop(messages: list, context: dict, active_request: str):
                 max_tokens = ESCALATED_MAX_TOKENS
                 state.has_escalated = True
                 print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
+                _iteration_end(iteration_id, "max_tokens_retry")
                 continue
             messages.append({"role": "assistant", "content": response.content})
             if state.recovery_count < MAX_RECOVERY_RETRIES:
                 messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                 state.recovery_count += 1
+                _iteration_end(iteration_id, "max_tokens_continue")
                 continue
+            _iteration_end(iteration_id, "max_tokens_exhausted")
             release_completed_assignment("agent")
             return
 
@@ -2955,6 +3021,7 @@ def agent_loop(messages: list, context: dict, active_request: str):
         if not has_tool_use(response.content):
             trigger_hooks("Stop", messages)
             remember_after_turn(messages)
+            _iteration_end(iteration_id, "stop")
             release_completed_assignment("agent")
             return
 
@@ -3006,6 +3073,7 @@ def agent_loop(messages: list, context: dict, active_request: str):
         messages.append({"role": "user", "content": build_user_content(results)})
         if compact_requested:
             messages[:] = compact_history(messages, active_request)
+        _iteration_end(iteration_id, "tools")
 
 
 def print_turn_assistants(messages: list, turn_start: int):
