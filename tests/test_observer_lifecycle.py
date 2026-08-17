@@ -382,23 +382,14 @@ def test_g_control_hooks_unchanged_with_observer():
     with tempfile.TemporaryDirectory() as tmp:
         s15 = _load_s15_offline(Path(tmp))
         stopped = []
+        # A PreToolUse hook that blocks "glob". We avoid "bash" here because
+        # s15's built-in permission_hook prompts interactively for it.
         s15.register_hook(
-            "PreToolUse", lambda block: ("DENIED" if block.name == "bash" else None)
+            "PreToolUse", lambda block: ("DENIED" if block.name == "glob" else None)
         )
         s15.register_hook("Stop", lambda messages: stopped.append(1) or None)
 
-        responses = [
-            types.SimpleNamespace(
-                stop_reason="tool_use",
-                content=[
-                    types.SimpleNamespace(
-                        type="tool_use", id="b1", name="bash",
-                        input={"command": "ls"},
-                    )
-                ],
-            ),
-            _end_turn_response(),
-        ]
+        responses = [_tool_use_response("glob", "g1"), _end_turn_response()]
         s15.client.messages.create = lambda **kwargs: responses.pop(0)
 
         events = []
@@ -408,7 +399,7 @@ def test_g_control_hooks_unchanged_with_observer():
         s15.agent_loop(history, {}, "test")
 
         assert stopped == [1]  # Stop hook fired
-        # PreToolUse blocked the bash tool -> a DENIED tool_result is recorded.
+        # PreToolUse blocked the glob tool -> a DENIED tool_result is recorded.
         assert any(
             isinstance(m, dict)
             and m.get("role") == "user"
